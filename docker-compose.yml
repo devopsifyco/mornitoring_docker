@@ -160,8 +160,7 @@ services:
         default_theme = light
         EOT
 
-        mkdir -p provisioning/datasources/ 
-        mkdir -p provisioning/dashboards/ 
+        mkdir -p provisioning/{datasources,dashboards}
 
         cat <<EOT > /home/provisioning/datasources/all.yml
         datasources:
