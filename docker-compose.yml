@@ -1,0 +1,279 @@
+version: '3.3'
+
+services:
+
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor
+    container_name: cadvisor
+    restart: always
+    privileged: true       
+    # ports:
+    #  - 8080:8080
+    devices:
+      - /dev/kmsg:/dev/kmsg
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:rw
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+      # - /cgroup:/cgroup:ro
+      - /etc/localtime:/etc/localtime:ro
+      - /dev/disk/:/dev/disk:ro
+
+
+  prometheus_init:
+    image: bash 
+    privileged: true       
+    volumes:
+      - prometheus_cfg:/home      
+    container_name: prometheus_init 
+    command: 
+      - bash
+      - -c
+      - |
+        cat <<EOT > /home/prometheus.yml
+        global:
+          scrape_interval: 1s
+          evaluation_interval: 15s
+          external_labels:
+            monitor: 'Project-Devopsify'
+
+        alerting:
+          alertmanagers:
+          - static_configs:
+            - targets:
+              - alertmanager:9093
+
+        # Load and evaluate rules in this file every 'evaluation_interval' seconds.
+        rule_files:
+          - "/etc/prometheus/alert.rules"
+
+        scrape_configs:
+          - job_name: prometheus
+            scrape_interval: 5s
+            scrape_timeout: 2s
+            honor_labels: true
+
+            static_configs:
+            - targets: ['prometheus:9090']
+          
+          - job_name: node-exporter
+            scrape_interval: 5s
+            scrape_timeout: 2s
+            honor_labels: true
+
+            static_configs:
+            - targets: ['node-exporter:9100']
+              labels:
+                instance: 'instance-1'
+
+
+          - job_name: cadvisor
+            scrape_interval: 5s
+            scrape_timeout: 2s
+            honor_labels: true
+
+            static_configs:
+            - targets: ['cadvisor:8080']
+        EOT
+
+        cat <<EOT > /home/alert.rules
+        groups:
+        - name: targets
+          rules:
+          - alert: monitor_service_down
+            expr: up == 0
+            for: 30s
+            labels:
+              severity: critical
+            annotations:
+              summary: "Monitor service non-operational"
+              description: "Service {{ $labels.instance }} is down."
+
+        - name: host
+          rules:
+          - alert: HighMemoryLoad
+            expr: (sum(node_memory_MemTotal_bytes) - sum(node_memory_MemFree_bytes + node_memory_Buffers_bytes + node_memory_Cached_bytes) ) / sum(node_memory_MemTotal_bytes) * 100 > 85
+            for: 2m
+            labels:
+              severity: warning
+            annotations:
+              summary: "Server memory is almost full"
+              description: "Docker host memory usage is {{ humanize $value}}%. Reported by instance {{ $labels.instance }} of job {{ $labels.job }}."
+
+        - name: containers
+          rules:
+          - alert: Mariadb_Down
+            expr: absent(container_memory_usage_bytes{name="project-report-mariadb"})
+            for: 30s
+            labels:
+              severity: critical
+            annotations:
+              summary: "Mariadb Container is Down"
+              description: "Mariadb container is down for more than 30 seconds."
+        EOT
+
+
+  prometheus:
+    image  : prom/prometheus:latest 
+    container_name: prometheus
+    restart: on-failure
+    volumes:
+      - prometheus_data:/prometheus   
+      - prometheus_cfg:/etc/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+    ports:
+      - 9090:9090
+    networks:
+      - monitoring
+    depends_on:
+      cadvisor:
+        condition: service_started
+      node-exporter:
+        condition: service_started
+      alertmanager:
+        condition: service_started
+      prometheus_init:
+        condition: service_started
+
+
+  grafana_init:
+    image: bash
+    container_name: grafana_int
+    user: "472"
+    volumes:
+      - grafana_cfg:/home
+    command: 
+      - bash
+      - -c
+      - |
+        cat <<EOT > /home/config.ini
+        [paths]
+        provisioning = /etc/grafana/provisioning
+
+        [server]
+        enable_gzip = true
+
+        [users]
+        default_theme = light
+        EOT
+
+        mkdir -p provisioning/datasources/ 
+        mkdir -p provisioning/dashboards/ 
+
+        cat <<EOT > /home/provisioning/datasources/all.yml
+        datasources:
+        - name: 'prom1'
+          type: 'prometheus'
+          access: 'proxy'
+          org_id: 1
+          url: 'http://prometheus:9090'
+          is_default: true
+          version: 1
+          editable: true
+        EOT
+
+        cat <<EOT > /home/provisioning/dashboards/all.yml
+        - name: 'default'
+          org_id: 1
+          folder: ''
+          type: 'file'
+          options:
+            folder: '/var/lib/grafana/dashboards'
+        EOT
+
+  grafana:
+    image: grafana/grafana
+    container_name: grafana
+    restart: always
+    user: root
+    volumes:
+      - grafana_cfg:/etc/grafana
+      - grafana_data:/var/lib/grafana
+    ports:
+      - 3000:3000
+    networks:
+      - monitoring
+    depends_on:
+      grafana_init:
+        condition: service_started
+
+  node-exporter:
+    image: prom/node-exporter:latest
+    container_name: node-exporter
+    restart: unless-stopped
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+    command:
+      - '--path.procfs=/host/proc'
+      - '--path.rootfs=/rootfs'
+      - '--path.sysfs=/host/sys'
+      - '--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)'
+    expose:
+      - 9100
+    networks:
+      - monitoring
+
+
+  alertmanager_init:
+    image: bash
+    privileged: true
+    container_name: alertmanager_init 
+    volumes:
+      - alertmanager_cfg:/home
+    command: 
+      - bash
+      - -c
+      - |
+        cat <<EOT > /home/config.yml
+        route:
+          receiver: 'Slack'
+          group_by: ['alertname']
+          group_wait:      15s
+          group_interval:  5m
+          repeat_interval: 3h
+
+        receivers:
+          - name: 'Slack'
+            webhook_configs:
+              - url: https://hooks.slack.com/services///
+                send_resolved: false
+                max_alerts: 3
+        EOT
+
+
+  alertmanager:
+    image: prom/alertmanager
+    container_name: alertmanager
+    restart: on-failure
+    # ports:
+    #   - "9093:9093"  
+    volumes:
+      - alertmanager_data:/alertmanager
+      - alertmanager_cfg:/etc/alertmanager
+    command:
+      - '--config.file=/etc/alertmanager/config.yml'
+      - '--storage.path=/alertmanager'
+    networks:
+      - monitoring
+    depends_on:
+      alertmanager_init:
+        condition: service_started
+
+
+networks:
+  monitoring:
+    driver: bridge
+
+
+volumes:
+  prometheus_data: {}
+  prometheus_cfg: {}
+  grafana_data: {}
+  grafana_cfg: {}
+  alertmanager_data: {}
+  alertmanager_cfg: {}
